@@ -11,3 +11,6 @@ env
 *.old
 *.swp
 *.zip
+*_scan.json
+reposrt.json
+report.json

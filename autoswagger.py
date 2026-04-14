@@ -20,9 +20,6 @@ from datetime import datetime
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Import Presidio for PII detection
-from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, Pattern, PatternRecognizer
-
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
@@ -36,13 +33,16 @@ TOTAL_REQUESTS = 0       # Tracks total requests sent by the tool
 SCAN_START_TIME = 0.0    # Records scan start time (for RPS calculation)
 SCAN_END_TIME = 0.0      # Records scan end time (for RPS calculation)
 
-# Initialize Presidio Analyzer with custom recognizers
-registry = RecognizerRegistry()
-
 # Initialize file_handler for log data output
 file_handler = None
 
-def setup_pii_recognizers():
+# Lazily initialized Presidio analyzer. This avoids import-time failures on
+# unsupported Python versions (e.g. Python 3.14) when only `-h` is requested.
+analyzer = None
+_pii_init_attempted = False
+_pii_init_error = None
+
+def setup_pii_recognizers(registry, Pattern, PatternRecognizer):
     """
     Adds custom recognizers for Person, Phone, Email, and Address to the Presidio registry
     with context words. Each recognizer uses a pattern and context to detect potential PII.
@@ -101,22 +101,57 @@ def setup_pii_recognizers():
     registry.add_recognizer(email_recognizer)
     registry.add_recognizer(address_recognizer)
 
-# Call setup function to prepare custom PII recognizers
-setup_pii_recognizers()
+def get_pii_analyzer():
+    """
+    Initialize Presidio only when PII detection is first needed.
+    Returns None if Presidio/spaCy is unavailable or incompatible.
+    """
+    global analyzer, _pii_init_attempted, _pii_init_error
+    if analyzer is not None:
+        return analyzer
+    if _pii_init_attempted:
+        return None
 
-# Initialize Presidio context-aware enhancer
-from presidio_analyzer.context_aware_enhancers import LemmaContextAwareEnhancer
+    _pii_init_attempted = True
+    try:
+        from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, Pattern, PatternRecognizer
+        from presidio_analyzer.context_aware_enhancers import LemmaContextAwareEnhancer
 
-context_aware_enhancer = LemmaContextAwareEnhancer(
-    context_similarity_factor=0.35,
-    min_score_with_context_similarity=0.4
-)
+        registry = RecognizerRegistry()
+        setup_pii_recognizers(registry, Pattern, PatternRecognizer)
 
-# Analyzer engine for detection
-analyzer = AnalyzerEngine(
-    registry=registry,
-    context_aware_enhancer=context_aware_enhancer
-)
+        context_aware_enhancer = LemmaContextAwareEnhancer(
+            context_similarity_factor=0.35,
+            min_score_with_context_similarity=0.4
+        )
+
+        analyzer = AnalyzerEngine(
+            registry=registry,
+            context_aware_enhancer=context_aware_enhancer
+        )
+    except Exception as exc:
+        _pii_init_error = exc
+        analyzer = None
+        msg = f"PII detection disabled (Presidio/spaCy init failed): {exc}"
+        if "log" in globals():
+            try:
+                log(msg, level="WARNING")
+            except Exception:
+                print(msg, file=sys.stderr)
+        else:
+            print(msg, file=sys.stderr)
+
+    return analyzer
+
+def analyze_pii_text(text):
+    pii_analyzer = get_pii_analyzer()
+    if pii_analyzer is None:
+        return []
+    return pii_analyzer.analyze(
+        text=text,
+        entities=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "ADDRESS"],
+        language='en'
+    )
 
 # Initialize Rich Console for formatted output
 console = Console()
@@ -623,11 +658,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
                         for kw in context_keywords:
                             if kw in col_name:
                                 cell_value = row_cols[i].strip()
-                                pres_res = analyzer.analyze(
-                                    text=cell_value,
-                                    entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
-                                    language='en'
-                                )
+                                pres_res = analyze_pii_text(cell_value)
                                 if pres_res:
                                     pii_detected = True
                                     for ent in pres_res:
@@ -648,11 +679,7 @@ def send_request(method, base_url_no_path, full_path, parameters, value_mapping,
 
                 for kw in context_keywords:
                     if kw in key_part:
-                        pres_res = analyzer.analyze(
-                            text=val_part,
-                            entities=["PERSON","EMAIL_ADDRESS","PHONE_NUMBER","ADDRESS"],
-                            language='en'
-                        )
+                        pres_res = analyze_pii_text(val_part)
                         if pres_res:
                             pii_detected = True
                             for ent in pres_res:
@@ -1089,13 +1116,19 @@ def extract_spec_from_js(js_text):
     for pat in patterns:
         matches = re.findall(pat, js_text, re.DOTALL)
         for var_name, obj_str in matches:
-            cleaned_str = js_object_to_json(obj_str)
-            if cleaned_str:
-                try:
-                    spec = json.loads(cleaned_str)
-                    return spec
-                except json.JSONDecodeError:
-                    continue
+                cleaned_str = js_object_to_json(obj_str)
+                if cleaned_str:
+                    try:
+                        spec = json.loads(cleaned_str)
+                        if isinstance(spec, dict):
+                            # Swagger UI init scripts often wrap the actual spec as
+                            # {"swaggerDoc": {...}, ...}; return the embedded spec.
+                            if isinstance(spec.get("swaggerDoc"), dict) and "paths" in spec["swaggerDoc"]:
+                                return spec["swaggerDoc"]
+                            if "paths" in spec:
+                                return spec
+                    except json.JSONDecodeError:
+                        continue
     return None
 
 def js_object_to_json(js_object_str):
@@ -1165,8 +1198,9 @@ def main(urls, verbose, include_risk, include_all, product_mode, stats_flag, rat
         with lock:
             stats["active_hosts"] += 1
 
-        # Check if the URL might be a direct spec (ends with .json/.yaml/.yml)
-        if any(base_url.lower().endswith(ext) for ext in ['.json', '.yaml', '.yml']):
+        # Check if the URL might be a direct spec. Some frameworks expose
+        # endpoints like /docs-json or /api-json (no .json suffix).
+        if any(base_url.lower().endswith(ext) for ext in ['.json', '.yaml', '.yml', '-json', '-yaml', '-yml']):
             if not product_mode:
                 log(f"Processing direct spec URL: {base_url}", level="INFO")
             swagger_spec = fetch_swagger_spec(base_url, verbose)
